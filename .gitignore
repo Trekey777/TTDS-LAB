@@ -1,0 +1,18 @@
+# JetBrains IDE (PyCharm / IDEA)
+.idea/
+*.iml
+
+# Environment secret files
+.env
+.env.*
+# Keep template example (optional, safe to commit)
+!.env.example
+
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
