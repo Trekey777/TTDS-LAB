@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 stemmer = PorterStemmer()
 IS_REMOVE_STOP_WORDS = True
 
-if IS_REMOVE_STOP_WORDS:
+if not IS_REMOVE_STOP_WORDS:
     stopwords = []
 else:
     with open("./ttds_2023_english_stop_words.txt", "r") as f:
@@ -21,8 +21,6 @@ else:
 """
     IO Function
 """
-
-
 def read_xml_file(file_name: str) -> dict[str, str]:
     tree = ET.parse(file_name)
     root = tree.getroot()
@@ -129,7 +127,7 @@ class Index:
         # tokenization
         tokens = re.findall(r"[a-z0-9]+(?:['-][a-z0-9]+)*", text.lower())
         # remove stopwords
-        if not stopwords:
+        if stopwords:
             tokens = [token for token in tokens if token not in stopwords]
         # stem
         tokens = [stemmer.stem(t) for t in tokens]
@@ -177,6 +175,7 @@ class Index:
 
 class SearchEngine:
     """
+    Search engine supporting the following features
         1. read_query
         2. query_parse
         3. boolean search
@@ -187,7 +186,12 @@ class SearchEngine:
     """
     def __init__(self, inverted_index):
         self.inverted_index = inverted_index
-        self.all_docs_set = {str(i) for i in range(1, int(self.inverted_index["number of docs"]) + 1)}
+        self.all_docs_set = {
+            doc_id
+            for token, info in self.inverted_index.items()
+            if token != "number of docs"
+            for doc_id in info["postings"]
+        }
         self.term_pattern = re.compile(r"^([a-zA-Z0-9]+)$")
         self.phrase_pattern = re.compile(r'"([A-Za-z]+)\s+([A-Za-z]+)"')
         self.proximity_pattern = re.compile(r"#(\d+)\(\s*([A-Za-z]+)\s*, \s*([A-Za-z]+)\)")
@@ -195,19 +199,49 @@ class SearchEngine:
             r'#\d+\(\s*[A-Za-z]+\s*,\s*[A-Za-z]+\s*\)'
             r'|"[^"]*"'
             r'|\b(?:AND|OR|NOT)\b'
-            r'|[A-Za-z0-9]+',
-            re.IGNORECASE,
+            r'|[A-Za-z0-9]+'
         )
+        #
+        self.forward_cached_tf_idf = defaultdict(dict)
+        self.docs_norm = {}
 
     # calculate term_tf_idf
     def term_tf_idf(self, term, doc_id) -> float:
+        if doc_id in self.forward_cached_tf_idf and term in self.forward_cached_tf_idf[doc_id]:
+            term_weight = self.forward_cached_tf_idf[doc_id][term]
+            return term_weight
         token_info= self.inverted_index.get(term, {})
         postings = token_info.get("postings", {})
         term_count = len(postings.get(doc_id, []))
         if not term_count:
             return 0.0
         term_weight =(1 + math.log10(term_count)) * self.idf(term)
+        self.forward_cached_tf_idf[doc_id][term] = term_weight
         return term_weight
+    # calculate vsm
+    def calculate_query_norm(self, vsm_dict: dict[str, float]) -> float:
+        query_norm = 0.0
+        for token, term_weight in vsm_dict.items():
+            query_norm += term_weight ** 2
+        return math.sqrt(query_norm)
+
+    # calculate doc_norms
+    def get_doc_norms(self, doc_id):
+        if doc_id in self.docs_norm:
+            return self.docs_norm[doc_id]
+        
+        squared_norms = defaultdict(float)
+        for token, token_info in self.inverted_index.items():
+            if token == "number of docs":
+                continue
+            postings = token_info.get("postings", {})
+            for docid, positons in postings.items():
+                weight = self.term_tf_idf(token, docid)
+                squared_norms[docid] += weight * weight
+
+        for docid, squared_sum in squared_norms.items():
+            self.docs_norm[docid] = math.sqrt(squared_sum)
+        return self.docs_norm.get(doc_id, 0.0)
 
     # calculate idf of term
     def idf(self, term):
@@ -216,6 +250,7 @@ class SearchEngine:
             raise ValueError("Term doesn't exist in any document")
         idf = math.log10(self.inverted_index["number of docs"] / token_info["df"])
         return idf
+
     def normal_single_term_index(self, term) -> dict[str, list[int]]:
         token = stemmer.stem(term.lower().strip())
         token_info = self.inverted_index.get(token)
@@ -244,7 +279,7 @@ class SearchEngine:
                 if self.positions_compare(pos_1, pos_2, distance, exact):
                     common_ret.add(common_index)
                     break
-                if file_1[i] <= file_2[j]:
+                if int(file_1[i]) <= int(file_2[j]):
                     i += 1
                 else:
                     j += 1
@@ -252,7 +287,6 @@ class SearchEngine:
 
     def normal_query_parse(self, query) -> set:
         terms = self.token_pattern.findall(query)
-        print(terms)
         pre_operator = None
         is_complement = False
         index_set_lists = []
@@ -291,37 +325,44 @@ class SearchEngine:
         return result_dict
 
     # process batch of text query
-    def text_query_batch_search(self, query_list) -> dict[str,dict[str, int]]:
+    def text_query_batch_search(self, query_list, mode:str = "ltn.ltn") -> dict[str,dict[str, int]]:
         all_results = {}
+        print(f"text query search mode: {mode}")
         for query in query_list:
             number, query_text = query.split(" ", maxsplit=1)
-            search_results = self.text_search(query_text)
+            search_results = self.text_search(query_text, mode)
             all_results[number] = search_results
         return all_results
 
     # return the final result of text query
-    def text_search(self, text_query: str):
+    def text_search(self, text_query: str, mode):
         # process the term_list
         term_list = [
             stemmer.stem(word.lower())
             for word in text_query.split()
             if word.lower() not in stopwords
         ]
-        return self.text_find_relevant_docs(term_list)
+        return self.text_find_relevant_docs(term_list, mode)
 
-
-    # find text search relevant_docs
-    def text_find_relevant_docs(self, term_list) -> dict:
+    def calculate_query_vsm(self, term_list) -> defaultdict[str,float]:
         # calculate tf-idf
-        query_vsm = {}
-        # calculate term frequency
+        query_vsm = defaultdict(float)
+
+        # calculate term frequency in query
         for term in term_list:
-            query_vsm[term] = query_vsm.get(term, 0) + 1
+            if term in self.inverted_index:
+                query_vsm[term] = query_vsm.get(term, 0) + 1
 
         for key, value in query_vsm.items():
             query_vsm[key] = (1 + math.log10(value)) * self.idf(key)
-        common_doc = set()
 
+        return query_vsm
+
+    def calculate_score(self, term_list):
+        query_vsm = self.calculate_query_vsm(term_list)
+
+        # find doc have the same words
+        common_doc = set()
         for key in query_vsm:
             if key in self.inverted_index:
                 common_doc.update(self.inverted_index[key]["postings"].keys())
@@ -334,12 +375,44 @@ class SearchEngine:
             docs[doc_id] = score
         docs = dict(sorted(docs.items(), key=lambda item: item[1], reverse=True))
         return docs
+    def calculate_cosine_similarity(self, term_list)-> defaultdict[str,float]:
+        query_vsm = self.calculate_query_vsm(term_list)
+        query_norm = self.calculate_query_norm(query_vsm)
+        if query_norm == 0:
+            return {}
+        # find doc have the same words
+        common_doc = set()
+        for key in query_vsm:
+            if key in self.inverted_index:
+                common_doc.update(self.inverted_index[key]["postings"].keys())
+        docs = {}
 
+        for doc_id in common_doc:
+            doc_norm = self.get_doc_norms(doc_id)
+            if doc_norm == 0.0 :
+                continue
+            score = 0
+            for key in query_vsm.keys():
+                score += self.term_tf_idf(key, doc_id) * query_vsm[key]
+            docs[doc_id] = score /(doc_norm * query_norm)
+        docs = dict(sorted(docs.items(), key=lambda item: item[1], reverse=True))
+        return docs
+    # find text search relevant_docs
+    def text_find_relevant_docs(self, term_list, mode) -> dict:
+
+        if mode == "ltn.ltn":
+            return self.calculate_score(term_list)
+
+        elif mode == "ltc.ltc":
+            return self.calculate_cosine_similarity(term_list)
+        return {}
 
     def phrase_match(self, w1, w2, distance) -> set:
         return self.positions_match(w1, w2, distance, True)
+
     def proximity_match(self, w1, w2, distance) -> set:
         return self.positions_match(w1, w2, distance, False)
+
     def single_term_process(self, term) -> set:
         term_match = self.term_pattern.fullmatch(term)
         if term_match:
@@ -372,17 +445,17 @@ if __name__ == '__main__':
     text_save_file = "./text_query_result.txt"
     normal_query = "./normal_query.txt"
     normal_query_save_file = "./normal_query_result.txt"
-    # doc_dict = read_xml_file(index_file)
-    # I = Index(doc_dict)
-    #
-    # inverted_index = I.build_inverted_index()
-    # save_inverted_index(inverted_index, index_save_file)
+    doc_dict = read_xml_file(index_file)
+    I = Index(doc_dict)
+
+    inverted_index = I.build_inverted_index()
+    save_inverted_index(inverted_index, index_save_file)
 
     inverted_index = load_inverted_index(index_save_file)
     se = SearchEngine(inverted_index)
     text_query_list = read_text_query(text_query)
     print(text_query_list)
-    text_results = se.text_query_batch_search(text_query_list)
+    text_results = se.text_query_batch_search(text_query_list,"ltc.ltc")
     with open(text_save_file, "w", encoding="utf-8") as f:
         for n, result in text_results.items():
             for key, value in result.items():
