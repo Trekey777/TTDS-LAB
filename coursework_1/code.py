@@ -7,6 +7,7 @@ from collections import defaultdict
 from nltk.stem import PorterStemmer
 from pathlib import Path
 import xml.etree.ElementTree as ET
+import time
 
 # Initialize the Porter
 stemmer = PorterStemmer()
@@ -17,7 +18,7 @@ if not IS_REMOVE_STOP_WORDS:
 else:
     with open("./ttds_2023_english_stop_words.txt", "r") as f:
         lines = f.readlines()
-        stopwords = [line.strip().lower() for line in lines]
+        stopwords = {line.strip().lower() for line in lines}
 """
     IO Function
 """
@@ -29,7 +30,7 @@ def read_xml_file(file_name: str) -> dict[str, str]:
     for doc in root.findall("DOC"):
         doc_id = doc.find("DOCNO").text.strip()
         text = doc.find("HEADLINE").text.strip()
-        text += "".join(doc.find("TEXT").itertext()).strip()
+        text += " " + "".join(doc.find("TEXT").itertext()).strip()
         doc_dict[doc_id] = text
 
     # sort documents by doc_id
@@ -93,23 +94,12 @@ def save_inverted_index(inverted_index: dict, file_name: str) -> None:
                 f.write(f"\t{doc_id}: {positions_text}\n")
 
 # support text query
-def read_text_query(file_path) -> list:
+def read_query(file_path) -> list:
     with open(file_path, "r", encoding="utf-8") as f:
         queries = f.readlines()
         query_list = list(map(str.strip, queries))
-    return query_list
+    return [q.strip() for q in queries if q.strip()]
 
-    # support boolean,phrase,proximity search
-def read_normal_query(file_path) -> list:
-    query_list = []
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            n, q = line.strip().split(":", maxsplit = 1)
-            query_list.append(q.strip())
-    return query_list
 
 
 class Index:
@@ -125,7 +115,7 @@ class Index:
     def text_parser(text:str, stemmer, stopwords) -> list[str]:
         text = text.lower()
         # tokenization
-        tokens = re.findall(r"[a-z0-9]+(?:['-][a-z0-9]+)*", text.lower())
+        tokens = re.findall(r"[a-z0-9]+", text.lower())
         # remove stopwords
         if stopwords:
             tokens = [token for token in tokens if token not in stopwords]
@@ -194,7 +184,7 @@ class SearchEngine:
         }
         self.term_pattern = re.compile(r"^([a-zA-Z0-9]+)$")
         self.phrase_pattern = re.compile(r'"([A-Za-z]+)\s+([A-Za-z]+)"')
-        self.proximity_pattern = re.compile(r"#(\d+)\(\s*([A-Za-z]+)\s*, \s*([A-Za-z]+)\)")
+        self.proximity_pattern = re.compile(r"#(\d+)\(\s*([A-Za-z]+)\s*,\s*([A-Za-z]+)\s*\)")
         self.token_pattern = re.compile(
             r'#\d+\(\s*[A-Za-z]+\s*,\s*[A-Za-z]+\s*\)'
             r'|"[^"]*"'
@@ -260,7 +250,7 @@ class SearchEngine:
 
     def positions_compare(self, pos1, pos2, distance, exact):
         if exact:
-            return abs(pos1 - pos2) == distance
+            return pos2 - pos1 == distance
         return abs(pos1 - pos2) <= distance
     # match the position
     def positions_match(self, w1, w2, distance, exact) -> set:
@@ -319,9 +309,9 @@ class SearchEngine:
     def normal_query_batch_process(self, query_list) -> defaultdict[str,list]:
         result_dict = defaultdict(list)
         for q in query_list:
-            ret = self.normal_query_parse(q)
-            print(f"Query {q} successfully processed")
-            result_dict[q] = sorted(ret, key = int)
+            number, q_text = q.split(" ", maxsplit=1)
+            ret = self.normal_query_parse(q_text)
+            result_dict[number] = sorted(ret, key = int)
         return result_dict
 
     # process batch of text query
@@ -337,10 +327,9 @@ class SearchEngine:
     # return the final result of text query
     def text_search(self, text_query: str, mode):
         # process the term_list
+        tokens = re.findall(r"[a-z0-9]+", text_query.lower())
         term_list = [
-            stemmer.stem(word.lower())
-            for word in text_query.split()
-            if word.lower() not in stopwords
+            stemmer.stem(t) for t in tokens if t not in stopwords
         ]
         return self.text_find_relevant_docs(term_list, mode)
 
@@ -371,7 +360,7 @@ class SearchEngine:
         for doc_id in common_doc:
             score = 0
             for key in query_vsm.keys():
-                score += self.term_tf_idf(key, doc_id) * query_vsm[key]
+                score += self.term_tf_idf(key, doc_id)
             docs[doc_id] = score
         docs = dict(sorted(docs.items(), key=lambda item: item[1], reverse=True))
         return docs
@@ -439,33 +428,42 @@ class SearchEngine:
 
 
 if __name__ == '__main__':
-    index_file = "./collections/trec.sample.xml"
+    index_file = "./trec.5000.xml"
     index_save_file = "./index.txt"
-    text_query = "./text_query.txt"
-    text_save_file = "./text_query_result.txt"
-    normal_query = "./normal_query.txt"
-    normal_query_save_file = "./normal_query_result.txt"
+    normal_query = "./queries.boolean.txt"
+    normal_query_save_file = "./results.boolean.txt"
+    ranked_query = "./queries.ranked.txt"
+    ranked_query_save_file = "./results.ranked.txt"
     doc_dict = read_xml_file(index_file)
+    start = time.time()
     I = Index(doc_dict)
 
     inverted_index = I.build_inverted_index()
+    end = time.time()
+    print(f"index created in {end-start} seconds")
     save_inverted_index(inverted_index, index_save_file)
 
     inverted_index = load_inverted_index(index_save_file)
     se = SearchEngine(inverted_index)
-    text_query_list = read_text_query(text_query)
-    print(text_query_list)
-    text_results = se.text_query_batch_search(text_query_list,"ltc.ltc")
-    with open(text_save_file, "w", encoding="utf-8") as f:
-        for n, result in text_results.items():
-            for key, value in result.items():
-                f.write(f"{n},{key},{value}\n")
-            f.write("\n")
+    start = time.time()
+    ranked_query_list = read_query(ranked_query)
+    # print(ranked_query_list)
+    ranked_results = se.text_query_batch_search(ranked_query_list)
+    end = time.time()
+    print(f"ranked query created in {end-start} seconds")
+    with open(ranked_query_save_file, "w", encoding="utf-8", newline="\n") as f:
+        for n, result in ranked_results.items():
+            for key, value in list(result.items())[:150]:
+                f.write(f"{n},{key},{value:.4f}\n")
 
-    normal_query_list = read_normal_query(normal_query)
-    print(text_query_list)
+    start = time.time()
+    normal_query_list = read_query(normal_query)
     normal_query_results = se.normal_query_batch_process(normal_query_list)
+    end = time.time()
+    print(f"normal query created in {end-start} seconds")
     with open(normal_query_save_file, "w", encoding="utf-8") as f:
         for n, result in normal_query_results.items():
-            f.write(f"{n},{result}\n")
+            for r in result:
+                f.write(f"{n},{r}\n")
+            f.write("\n")
 
